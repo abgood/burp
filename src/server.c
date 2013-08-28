@@ -52,7 +52,7 @@ static void usr2handler(int sig)
 	gentleshutdown_logged=0;
 }
 
-static int init_listen_socket(const char *port, int alladdr)
+static int do_init_listen_socket(const char *port, int ai_flags, int ai_family, const char *desc)
 {
 	int rfd;
 	int gai_ret;
@@ -65,13 +65,9 @@ static int init_listen_socket(const char *port, int alladdr)
 	struct addrinfo *rp=NULL;
 
 	memset(&hints, 0, sizeof(struct addrinfo));
-#ifdef HAVE_IPV6
-	hints.ai_family = AF_INET6;
-#else
-	hints.ai_family = AF_INET;
-#endif /* HAVE_IPV6 */
+	hints.ai_family = ai_family;
 	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_flags = alladdr ? AI_PASSIVE : 0;
+	hints.ai_flags = ai_flags;
 	hints.ai_protocol = IPPROTO_TCP;
 	hints.ai_canonname = NULL;
 	hints.ai_addr = NULL;
@@ -79,8 +75,8 @@ static int init_listen_socket(const char *port, int alladdr)
 
 	if((gai_ret=getaddrinfo(NULL, port, &hints, &result)))
 	{
-		logp("unable to getaddrinfo on port %s: %s\n",
-			port, gai_strerror(gai_ret));
+		logp("unable to getaddrinfo on %s port %s: %s\n",
+			desc, port, gai_strerror(gai_ret));
 		return -1;
 	}
 
@@ -89,31 +85,28 @@ static int init_listen_socket(const char *port, int alladdr)
 		rfd=socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
 		if(rfd<0)
 		{
-			logp("unable to create socket on port %s: %s\n",
-				port, strerror(errno));
+			logp("unable to create %s socket on port %s: %s\n",
+				desc, port, strerror(errno));
 			continue;
 		}
 		if(!bind(rfd, rp->ai_addr, rp->ai_addrlen)) break;
-		logp("unable to bind socket on port %s: %s\n",
-			port, strerror(errno));
+		logp("unable to bind %s socket on port %s: %s\n",
+			desc, port, strerror(errno));
 		close(rfd);
 		rfd=-1;
 	}
 	if(!rp || rfd<0)
 	{
-		logp("unable to bind listening socket on port %s\n", port);
+		logp("unable to bind listening %s socket on port %s\n",
+			desc, port);
 		return -1;
 	}
 
 #ifdef HAVE_IPV6
-	if (rp->ai_family == AF_INET6) {
-		sockopt_ret = setsockopt(rfd, IPPROTO_IPV6, IPV6_V6ONLY, &no, sizeof(no));
-	}
-
-	if(!sockopt_ret)
+	if(rp->ai_family==AF_INET6
+	  && !setsockopt(rfd, IPPROTO_IPV6, IPV6_V6ONLY, &no, sizeof(no)))
 	{
-		logp("unable to change socket option to "
-			"listen on both IPv4 and IPv6\n");
+		logp("unable to change %s socket option to listen on both IPv4 and IPv6\n", desc);
 		return -1;
 	}
 #endif
@@ -126,7 +119,7 @@ static int init_listen_socket(const char *port, int alladdr)
 	if(listen(rfd, 5)<0)
 	{
 		close_fd(&rfd);
-		logp("could not listen on main socket %d\n", port);
+		logp("could not listen on main %s socket %d\n", desc, port);
 		return -1;
 	}
 
@@ -137,6 +130,21 @@ static int init_listen_socket(const char *port, int alladdr)
 	}
 #endif
 
+	return rfd;
+}
+
+static int init_listen_socket(const char *port, int ai_flags)
+{
+	int rfd;
+	int reassure=0;
+#ifdef HAVE_IPV6
+	if((rfd=do_init_listen_socket(port, ai_flags, AF_INET6, "IPv6"))>=0)
+		return rfd;
+	else
+		reassure=1;
+#endif
+	if((rfd=do_init_listen_socket(port, ai_flags, AF_INET, "IPv4"))>=0
+	  && reassure) logp("IPv4 is OK\n");
 	return rfd;
 }
 
@@ -2044,7 +2052,7 @@ static int run_server(struct config *conf, const char *configfile, int *rfd, con
 	  || strcmp(oldport, conf->port))
 	{
 		close_fd(rfd);
-		if((*rfd=init_listen_socket(conf->port, 1))<0)
+		if((*rfd=init_listen_socket(conf->port, AI_PASSIVE))<0)
 			return 1;
 	}
 	if(conf->status_port
