@@ -52,66 +52,82 @@ static void usr2handler(int sig)
 	gentleshutdown_logged=0;
 }
 
-static int do_init_listen_socket(const char *port, int ai_flags, int ai_family, const char *desc)
+#ifdef HAVE_IPV6
+static int do_ipv6_listen_socket(const char *port, const char *desc)
 {
 	int rfd;
+	int no=0;
 	int gai_ret;
-#ifdef HAVE_IPV6
-	int no = 0;
-	int sockopt_ret = 0;
-#endif
-	struct addrinfo hints;
-	struct addrinfo *result=NULL;
-	struct addrinfo *rp=NULL;
+	struct sockaddr_in6 name;
 
-	memset(&hints, 0, sizeof(struct addrinfo));
-	hints.ai_family = ai_family;
-	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_flags = ai_flags;
-	hints.ai_protocol = IPPROTO_TCP;
-	hints.ai_canonname = NULL;
-	hints.ai_addr = NULL;
-	hints.ai_next = NULL;
-
-	if((gai_ret=getaddrinfo(NULL, port, &hints, &result)))
+	name.sin6_family=AF_INET6;
+	name.sin6_port=htons(atoi(port));
+	name.sin6_addr=in6addr_loopback;
+	rfd=socket(AF_INET6, SOCK_STREAM, IPPROTO_TCP);
+	if(rfd<0)
 	{
-		logp("unable to getaddrinfo on %s port %s: %s\n",
-			desc, port, gai_strerror(gai_ret));
+		logp("unable to create %s socket on port %s: %s\n",
+			desc, port, strerror(errno));
 		return -1;
 	}
-
-	for(rp=result; rp; rp=rp->ai_next)
+	if(bind(rfd, (struct sockaddr *)&name, sizeof(name)))
 	{
-		rfd=socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-		if(rfd<0)
-		{
-			logp("unable to create %s socket on port %s: %s\n",
-				desc, port, strerror(errno));
-			continue;
-		}
-		if(!bind(rfd, rp->ai_addr, rp->ai_addrlen)) break;
 		logp("unable to bind %s socket on port %s: %s\n",
 			desc, port, strerror(errno));
 		close(rfd);
-		rfd=-1;
-	}
-	if(!rp || rfd<0)
-	{
-		logp("unable to bind listening %s socket on port %s\n",
-			desc, port);
 		return -1;
 	}
 
-#ifdef HAVE_IPV6
-	if(rp->ai_family==AF_INET6
-	  && !setsockopt(rfd, IPPROTO_IPV6, IPV6_V6ONLY, &no, sizeof(no)))
+	if(!setsockopt(rfd, IPPROTO_IPV6, IPV6_V6ONLY, &no, sizeof(no)))
 	{
 		logp("unable to change %s socket option to listen on both IPv4 and IPv6\n", desc);
 		return -1;
 	}
+
+	reuseaddr(rfd);
+
+	// Say that we are happy to accept connections.
+	if(listen(rfd, 5)<0)
+	{
+		close_fd(&rfd);
+		logp("could not listen on main %s socket %d\n", desc, port);
+		return -1;
+	}
+
+#ifdef HAVE_WIN32
+	{
+		u_long ioctlArg=0;
+		ioctlsocket(rfd, FIONBIO, &ioctlArg);
+	}
 #endif
 
-	freeaddrinfo(result);
+	return rfd;
+}
+#endif
+
+static int do_ipv4_listen_socket(const char *port, uint32_t hostlong, const char *desc)
+{
+	int rfd;
+	int gai_ret;
+	struct sockaddr_in name;
+
+	name.sin_family=AF_INET;
+	name.sin_port=htons(atoi(port));
+	name.sin_addr.s_addr=htonl(hostlong);
+	rfd=socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if(rfd<0)
+	{
+		logp("unable to create %s socket on port %s: %s\n",
+			desc, port, strerror(errno));
+		return -1;
+	}
+	if(bind(rfd, (struct sockaddr *)&name, sizeof(name)))
+	{
+		logp("unable to bind %s socket on port %s: %s\n",
+			desc, port, strerror(errno));
+		close(rfd);
+		return -1;
+	}
 
 	reuseaddr(rfd);
 
@@ -133,17 +149,18 @@ static int do_init_listen_socket(const char *port, int ai_flags, int ai_family, 
 	return rfd;
 }
 
-static int init_listen_socket(const char *port, int ai_flags)
+static int init_listen_socket(const char *port, int alladdrs)
 {
 	int rfd;
 	int reassure=0;
 #ifdef HAVE_IPV6
-	if((rfd=do_init_listen_socket(port, ai_flags, AF_INET6, "IPv6"))>=0)
-		return rfd;
+	if((rfd=do_ipv6_listen_socket(port, "IPv6"))>=0)
+			return rfd;
 	else
 		reassure=1;
 #endif
-	if((rfd=do_init_listen_socket(port, ai_flags, AF_INET, "IPv4"))>=0
+	if((rfd=do_ipv4_listen_socket(port,
+		alladdrs?INADDR_ANY:INADDR_LOOPBACK, "IPv4"))>=0
 	  && reassure) logp("IPv4 is OK\n");
 	return rfd;
 }
@@ -2052,7 +2069,7 @@ static int run_server(struct config *conf, const char *configfile, int *rfd, con
 	  || strcmp(oldport, conf->port))
 	{
 		close_fd(rfd);
-		if((*rfd=init_listen_socket(conf->port, AI_PASSIVE))<0)
+		if((*rfd=init_listen_socket(conf->port, 1))<0)
 			return 1;
 	}
 	if(conf->status_port
